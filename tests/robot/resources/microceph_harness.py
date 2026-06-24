@@ -220,6 +220,71 @@ class microceph_harness:
             )
         return res
 
+    # Substrings that mark a snap command failure as a transient snap-store
+    # outage rather than a real error. snapd reports these when the store is
+    # unreachable or rate-limiting (HTTP 408/5xx, assertion/nonce fetch).
+    _SNAP_STORE_ERROR_PATTERNS = (
+        "store server returned status",
+        "cannot get nonce from store",
+        "unable to contact snap store",
+        "snap store returned",
+        "cannot communicate with server",
+    )
+
+    @staticmethod
+    def _is_snap_store_error(err_text):
+        """True if *err_text* looks like a transient snap-store outage."""
+        return any(p in err_text for p in microceph_harness._SNAP_STORE_ERROR_PATTERNS)
+
+    def _retry_on_snap_store_error(self, run_fn, max_attempts, label):
+        """Calls run_fn() up to max_attempts times, retrying on snap-store errors.
+
+        run_fn must return an ExecResult. A non-store error (or exhausted
+        store-retries) raises an AssertionError like run_in_vm_and_check.
+        """
+        for attempt in range(max_attempts):
+            res = run_fn()
+            if res.rc == 0:
+                return res
+            err = f"{res.stderr or ''}{res.stdout or ''}"
+            if not self._is_snap_store_error(err) or attempt == max_attempts - 1:
+                raise AssertionError(
+                    f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}"
+                )
+            logger.warn(f"snap store error ({label}) attempt {attempt + 1}/{max_attempts}: "
+                        f"{err.strip()[:200]}; retrying in 15s...")
+            time.sleep(15)
+        # Unreachable: the loop either returns or raises on the last attempt.
+        return None
+
+    def run_snap_in_vm_with_retry(self, bash_cmd, timeout=300, max_attempts=3):
+        """Runs a snap command in the VM, retrying on transient snap-store errors.
+
+        snap operations contact the Snap Store to fetch assertions / refresh
+        snapd, and can fail transiently when the store returns 408/5xx
+        (``cannot get nonce from store: store server returned status 408``,
+        ``unable to contact snap store``). These are infra timeouts, not real
+        failures, and a single failure used to abort suite setup (e.g. the
+        Regression test for sequential join mon host refresh). Retry up to
+        max_attempts with backoff; a non-store error fails immediately, and
+        exhausted store-retries raise like run_in_vm_and_check.
+        """
+        return self._retry_on_snap_store_error(
+            lambda: self.run_in_vm(bash_cmd, timeout), max_attempts, "vm"
+        )
+
+    def run_snap_in_container_with_retry(self, container, cmd, timeout=300, max_attempts=3, shell="sh"):
+        """Runs a snap command in an inner container, retrying on snap-store errors.
+
+        Container counterpart to run_snap_in_vm_with_retry, for store-hitting
+        snap installs that run inside inner LXD containers (e.g. multi-node
+        ``snap install microceph --channel``).
+        """
+        return self._retry_on_snap_store_error(
+            lambda: self.run_in_container_unchecked(container, cmd, timeout, shell),
+            max_attempts, f"container {container}",
+        )
+
     def run_in_vm_must_fail(self, bash_cmd, timeout=120):
         """Runs a bash command inside the outer VM and fails if it SUCCEEDS (expects non-zero)."""
         res = self.run_in_vm(bash_cmd, timeout)
@@ -1284,7 +1349,7 @@ class microceph_harness:
             self.ensure_snap_mount_healthy(container)
             # Store install needs only s3cmd (not jq), so the apt-get install list is
             # kept literal rather than driven from VM_APT_TOOLS.
-            self.run_in_container_and_check(
+            self.run_snap_in_container_with_retry(
                 container,
                 f"sudo snap remove --purge microceph >/dev/null 2>&1 || true; sudo apt-get update -qq && sudo apt-get -qq -y install s3cmd && sudo snap install microceph --channel {channel}",
                 600,
