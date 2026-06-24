@@ -63,9 +63,9 @@ Setup LXD In VM
     Log To Console    [setup] Setting up LXD inside ${OUTER_VM} (may take several minutes)...
     ${check}=    Run In VM    sudo snap list | grep -cF "lxd" || true    30
     IF    "${check.stdout.strip()}" != "1"
-        Run In VM And Check    sudo snap install lxd    300
+        Run Snap In VM With Retry    sudo snap install lxd    300
     END
-    Run In VM And Check    sudo snap refresh    300
+    Run Snap In VM With Retry    sudo snap refresh    300
     Run In VM And Check    sudo snap set lxd daemon.group=adm    30
     # Force a btrfs (copy-on-write) storage pool. On the default "dir" backend every
     # lxc init / publish is a full rootfs copy, which serializes ~6 x 1.5GB copies in

@@ -12,6 +12,7 @@ Run with pytest:
 
 import json
 
+from microceph_harness import ExecResult
 from microceph_harness import microceph_harness as H
 from cluster_ops import parse_migration_status
 from snap_services import enabled_active_services
@@ -770,3 +771,99 @@ def test_parse_migration_status_requires_two_space_indent():
 def test_parse_migration_status_absent_node_is_false():
     src_ok, dst_ok = parse_migration_status(_MIGRATED_STATUS, "node-wrk7", "node-wrk8")
     assert (src_ok, dst_ok) == (False, False)
+
+
+# ---------------------------------------------------------------------------
+# snap-store retry behaviour (_is_snap_store_error + _retry_on_snap_store_error)
+# ---------------------------------------------------------------------------
+
+def test_is_snap_store_error_detects_408_nonce():
+    err = "error: cannot perform the following tasks:\n- Fetch and check assertions for snap \"snapd\" (26865) (cannot get nonce from store: store server returned status 408)"
+    assert H._is_snap_store_error(err) is True
+
+
+def test_is_snap_store_error_detects_unable_to_contact():
+    assert H._is_snap_store_error("error: unable to contact snap store") is True
+
+
+def test_is_snap_store_error_detects_cannot_communicate():
+    assert H._is_snap_store_error("cannot communicate with server: Get ...: dial tcp: i/o timeout") is True
+
+
+def test_is_snap_store_error_false_for_real_failure():
+    # A genuine snap install failure (bad channel) is NOT a store outage.
+    assert H._is_snap_store_error('error: snap "microceph" not found') is False
+    assert H._is_snap_store_error("error: unknown flag --foo") is False
+
+
+def _make_snap_retry_harness(results):
+    """h with run_in_vm returning scripted ExecResults; time.sleep stubbed."""
+    h = H.__new__(H)
+    calls = {"i": 0, "sleeps": []}
+
+    def fake_run_in_vm(cmd, timeout):
+        i = calls["i"]
+        calls["i"] += 1
+        return results[min(i, len(results) - 1)]
+
+    h.run_in_vm = fake_run_in_vm
+    import microceph_harness as _mh
+    _orig_sleep = _mh.time.sleep
+    _mh.time.sleep = lambda secs: calls["sleeps"].append(secs)
+
+    def restore():
+        _mh.time.sleep = _orig_sleep
+    return h, calls, restore
+
+
+def test_snap_retry_succeeds_first_try():
+    h, calls, restore = _make_snap_retry_harness([ExecResult(0, "installed", "")])
+    try:
+        res = h.run_snap_in_vm_with_retry("sudo snap install lxd", 300)
+        assert res.rc == 0
+        assert calls["i"] == 1
+        assert calls["sleeps"] == []
+    finally:
+        restore()
+
+
+def test_snap_retry_absorbs_store_408_then_succeeds():
+    results = [
+        ExecResult(1, "", "cannot get nonce from store: store server returned status 408"),
+        ExecResult(0, "installed", ""),
+    ]
+    h, calls, restore = _make_snap_retry_harness(results)
+    try:
+        res = h.run_snap_in_vm_with_retry("sudo snap install lxd", 300)
+        assert res.rc == 0
+        assert calls["i"] == 2
+        assert calls["sleeps"] == [15]
+    finally:
+        restore()
+
+
+def test_snap_retry_does_not_retry_non_store_error():
+    # A non-store error must fail immediately without retrying.
+    results = [ExecResult(1, "", 'error: snap "nope" not found')]
+    h, calls, restore = _make_snap_retry_harness(results)
+    try:
+        import pytest
+        with pytest.raises(AssertionError, match="not found"):
+            h.run_snap_in_vm_with_retry("sudo snap install nope", 300)
+        assert calls["i"] == 1  # no retry on non-store error
+        assert calls["sleeps"] == []
+    finally:
+        restore()
+
+
+def test_snap_retry_raises_after_exhausting_store_retries():
+    results = [ExecResult(1, "", "unable to contact snap store")] * 3
+    h, calls, restore = _make_snap_retry_harness(results)
+    try:
+        import pytest
+        with pytest.raises(AssertionError, match="unable to contact snap store"):
+            h.run_snap_in_vm_with_retry("sudo snap refresh", 300)
+        assert calls["i"] == 3
+        assert calls["sleeps"] == [15, 15]
+    finally:
+        restore()
