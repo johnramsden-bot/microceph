@@ -893,11 +893,27 @@ class microceph_harness:
         return BuiltIn().get_variable_value("${SNAP_PATH}", "") or ""
 
     def _lxc_file_push(self, src, dest, timeout, errlabel):
-        """Pushes *src* to *dest* via lxc file push, failing on non-zero rc."""
-        res = self._exec(["lxc", "file", "push", src, dest], timeout)
-        if res.rc != 0:
-            raise AssertionError(f"Failed to {errlabel}: {res.stderr}")
-        return res
+        """Pushes *src* to *dest* via lxc file push, retrying transient failures.
+
+        lxc file push can fail transiently with a forkfile socket reset
+        (``read unix @->/proc/self/fd/22/forkfile.sock: read: connection reset
+        by peer``) when the LXD VM agent is momentarily busy. A single failure
+        used to abort the whole suite setup (e.g. Test maintenance mode). Retry
+        up to 3 times with backoff, matching the launch_outer_test_vm retry
+        pattern. A persistent failure still raises after the final attempt.
+        """
+        max_attempts = 3
+        last_err = ""
+        for attempt in range(max_attempts):
+            res = self._exec(["lxc", "file", "push", src, dest], timeout)
+            if res.rc == 0:
+                return res
+            last_err = res.stderr
+            if attempt < max_attempts - 1:
+                logger.warn(f"lxc file push {src} -> {dest} failed (attempt "
+                            f"{attempt + 1}/{max_attempts}): {last_err}; retrying in 10s...")
+                time.sleep(10)
+        raise AssertionError(f"Failed to {errlabel} after {max_attempts} attempts: {last_err}")
 
     def launch_outer_test_vm(self, vm_name=None, disk_size=None, enable_nesting=False):
         """Launches the LXD VM used as the test boundary, deleting any pre-existing instance."""
