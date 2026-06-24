@@ -12,6 +12,7 @@ Run with pytest:
 
 import json
 
+from microceph_harness import ExecResult
 from microceph_harness import microceph_harness as H
 from cluster_ops import parse_migration_status
 from snap_services import enabled_active_services
@@ -770,3 +771,68 @@ def test_parse_migration_status_requires_two_space_indent():
 def test_parse_migration_status_absent_node_is_false():
     src_ok, dst_ok = parse_migration_status(_MIGRATED_STATUS, "node-wrk7", "node-wrk8")
     assert (src_ok, dst_ok) == (False, False)
+
+
+# ---------------------------------------------------------------------------
+# _lxc_file_push retry behaviour
+# ---------------------------------------------------------------------------
+
+def _make_harness_with_exec(exec_results):
+    """Build a microceph_harness whose _exec returns scripted ExecResults in order."""
+    h = H.__new__(H)  # bypass __init__ (no Robot context needed for this method)
+    calls = {"i": 0, "sleeps": []}
+
+    def fake_exec(argv, timeout):
+        i = calls["i"]
+        calls["i"] += 1
+        return exec_results[min(i, len(exec_results) - 1)]
+
+    h._exec = fake_exec
+    # Stub time.sleep so the test doesn't actually wait 10s per retry.
+    import microceph_harness as _mh
+    _orig_sleep = _mh.time.sleep
+    _mh.time.sleep = lambda secs: calls["sleeps"].append(secs)
+
+    def restore():
+        _mh.time.sleep = _orig_sleep
+    return h, calls, restore
+
+
+def test_lxc_file_push_succeeds_first_try():
+    h, calls, restore = _make_harness_with_exec([ExecResult(0, "", "")])
+    try:
+        res = h._lxc_file_push("/src", "vm/dest", 60, "push thing")
+        assert res.rc == 0
+        assert calls["i"] == 1  # no retry
+        assert calls["sleeps"] == []
+    finally:
+        restore()
+
+
+def test_lxc_file_push_retries_transient_then_succeeds():
+    # First attempt: forkfile socket reset (transient). Second: success.
+    results = [
+        ExecResult(1, "", "connection reset by peer"),
+        ExecResult(0, "", ""),
+    ]
+    h, calls, restore = _make_harness_with_exec(results)
+    try:
+        res = h._lxc_file_push("/src", "vm/dest", 60, "push thing")
+        assert res.rc == 0
+        assert calls["i"] == 2  # retried once
+        assert calls["sleeps"] == [10]  # one 10s backoff before the retry
+    finally:
+        restore()
+
+
+def test_lxc_file_push_raises_after_exhausting_retries():
+    results = [ExecResult(1, "", "connection reset by peer")] * 3
+    h, calls, restore = _make_harness_with_exec(results)
+    try:
+        import pytest
+        with pytest.raises(AssertionError, match="push thing after 3 attempts"):
+            h._lxc_file_push("/src", "vm/dest", 60, "push thing")
+        assert calls["i"] == 3  # tried all 3 attempts
+        assert calls["sleeps"] == [10, 10]  # backoff between attempts 1->2 and 2->3
+    finally:
+        restore()
